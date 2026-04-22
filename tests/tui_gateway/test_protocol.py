@@ -421,7 +421,7 @@ def test_command_dispatch_returns_skill_payload(server):
     fake_msg = "Loaded skill content here"
 
     with patch("agent.skill_commands.scan_skill_commands", return_value=fake_skills), \
-         patch("agent.skill_commands.build_skill_invocation_message", return_value=fake_msg):
+         patch("agent.skill_commands.build_skill_invocation_message", return_value=fake_msg) as mock_build:
         resp = server.handle_request({
             "id": "r2",
             "method": "command.dispatch",
@@ -433,6 +433,7 @@ def test_command_dispatch_returns_skill_payload(server):
     assert result["type"] == "skill"
     assert result["message"] == fake_msg
     assert result["name"] == "hermes-agent-dev"
+    assert mock_build.call_args.kwargs["task_id"] == sid
 
 
 # ── dispatch(): pool routing for long handlers (#12546) ──────────────

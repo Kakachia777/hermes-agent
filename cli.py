@@ -14,6 +14,7 @@ Usage:
 """
 
 import logging
+import math
 import os
 import shutil
 import sys
@@ -205,6 +206,117 @@ def _parse_service_tier_config(raw: str) -> str | None:
         return "priority"
     logger.warning("Unknown service_tier '%s', ignoring", raw)
     return None
+
+
+_LOOP_NAME_PREFIX = "[loop]"
+_LOOP_DEFAULT_INTERVAL = "10m"
+_LOOP_INTERVAL_RE = re.compile(
+    r"(?P<value>\d+)\s*(?P<unit>s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)",
+    re.IGNORECASE,
+)
+_LOOP_TRAILING_EVERY_RE = re.compile(
+    rf"^(?P<prompt>.+?)\s+every\s+(?P<interval>{_LOOP_INTERVAL_RE.pattern})$",
+    re.IGNORECASE,
+)
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    stripped = text.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
+        return stripped[1:-1].strip()
+    return stripped
+
+
+def _loop_job_name(prompt: str) -> str:
+    preview = " ".join((prompt or "").split())
+    preview = preview[:42].rstrip()
+    return f"{_LOOP_NAME_PREFIX} {preview or 'scheduled prompt'}"
+
+
+def _format_loop_cadence(minutes: int) -> str:
+    if minutes % 1440 == 0:
+        days = minutes // 1440
+        return f"every {days} day{'s' if days != 1 else ''}"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"every {hours} hour{'s' if hours != 1 else ''}"
+    return f"every {minutes} minute{'s' if minutes != 1 else ''}"
+
+
+def _parse_loop_interval(interval_text: str) -> Dict[str, Any]:
+    raw = str(interval_text or "").strip()
+    match = _LOOP_INTERVAL_RE.fullmatch(raw)
+    if not match:
+        raise ValueError("Invalid interval. Use forms like 30m, 2h, 1d, or 45s.")
+
+    value = int(match.group("value"))
+    unit = match.group("unit").lower()
+    notes: list[str] = []
+
+    if unit.startswith("s"):
+        minutes = max(1, (value + 59) // 60)
+        if value % 60:
+            notes.append(
+                f"Seconds are rounded up to minutes here, so {raw} became {_format_loop_cadence(minutes)}."
+            )
+    elif unit.startswith("m"):
+        minutes = value
+    elif unit.startswith("h"):
+        minutes = value * 60
+    else:
+        minutes = value * 1440
+
+    return {
+        "minutes": minutes,
+        "schedule": f"every {minutes}m",
+        "cadence": _format_loop_cadence(minutes),
+        "notes": notes,
+    }
+
+
+def _parse_loop_command(command: str) -> Dict[str, Any]:
+    cmd = str(command or "").strip()
+    body = cmd.split(maxsplit=1)[1].strip() if " " in cmd else ""
+    if not body:
+        return {"action": "help"}
+
+    lowered = body.lower()
+    if lowered == "list":
+        return {"action": "list"}
+    if lowered == "clear":
+        return {"action": "clear"}
+
+    interval_text = _LOOP_DEFAULT_INTERVAL
+    prompt_text = body
+
+    leading = re.match(rf"^(?P<interval>{_LOOP_INTERVAL_RE.pattern})\s+(?P<prompt>.+)$", body, re.IGNORECASE)
+    if leading:
+        interval_text = leading.group("interval")
+        prompt_text = leading.group("prompt")
+    else:
+        trailing = _LOOP_TRAILING_EVERY_RE.match(body)
+        if trailing:
+            interval_text = trailing.group("interval")
+            prompt_text = trailing.group("prompt")
+
+    prompt_text = _strip_wrapping_quotes(prompt_text)
+    if not prompt_text:
+        raise ValueError("Usage: /loop [interval] <prompt>, /loop <prompt> every <interval>, /loop list, /loop clear")
+
+    parsed_interval = _parse_loop_interval(interval_text)
+    return {
+        "action": "create",
+        "prompt": prompt_text,
+        **parsed_interval,
+    }
+
+
+def _build_loop_runtime_note(job: Dict[str, Any]) -> str:
+    return (
+        "This prompt was triggered by Hermes' built-in session-scoped /loop command. "
+        f"Job ID: {job['id']}. Cadence: {job['cadence']}. "
+        "Treat this as a recurring follow-up in the same chat. Prefer reporting what changed since the last run when that makes sense."
+    )
 
 
 
@@ -1650,6 +1762,7 @@ from agent.skill_commands import (
     build_skill_invocation_message,
     build_plan_path,
     build_preloaded_skills_prompt,
+    get_skill_allowed_tools,
 )
 
 _skill_commands = scan_skill_commands()
@@ -2017,6 +2130,8 @@ class HermesCLI:
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        self._loop_jobs: dict[str, dict[str, Any]] = {}
+        self._loop_lock = threading.Lock()
         self._should_exit = False
         self._last_ctrl_c_time = 0
         self._clarify_state = None
@@ -2031,6 +2146,7 @@ class HermesCLI:
         self._model_picker_state = None
         self._secret_state = None
         self._secret_deadline = 0
+        self._register_session_loop_target()
         self._spinner_text: str = ""  # thinking spinner text for TUI
         self._tool_start_time: float = 0.0  # monotonic timestamp when current tool started (for live elapsed)
         self._pending_tool_info: dict = {}  # function_name -> list of (preview, args) for stacked scrollback
@@ -2121,6 +2237,58 @@ class HermesCLI:
         emoji = "⏱" if live else "⏲"
         return f"{emoji} {time_str}"
 
+    def _format_loop_countdown(self, next_run_at: Optional[float]) -> Optional[str]:
+        """Format the countdown until the next scheduled /loop fire."""
+        if next_run_at is None:
+            return None
+        remaining = max(0, int(math.ceil(float(next_run_at) - time.time())))
+        if remaining <= 0:
+            return "⏲ due"
+
+        days, rem = divmod(remaining, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, seconds = divmod(rem, 60)
+
+        if days > 0:
+            time_str = f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            time_str = f"{hours}h {minutes}m {seconds}s" if seconds else f"{hours}h {minutes}m"
+        elif minutes > 0:
+            time_str = f"{minutes}m {seconds}s" if seconds else f"{minutes}m"
+        else:
+            time_str = f"{seconds}s"
+        return f"⏲ {time_str}"
+
+    def _get_next_loop_run_at(self) -> Optional[float]:
+        jobs = getattr(self, "_loop_jobs", None) or {}
+        lock = getattr(self, "_loop_lock", None)
+        runs: list[float] = []
+
+        def _collect_runs() -> None:
+            for job in jobs.values():
+                try:
+                    run_at = float(job.get("next_run_at"))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                runs.append(run_at)
+
+        if lock is not None:
+            with lock:
+                _collect_runs()
+        else:
+            _collect_runs()
+
+        try:
+            from tools.session_loop_tool import get_next_session_loop_run_at
+
+            shared_next = get_next_session_loop_run_at(session_id=getattr(self, "session_id", ""))
+            if shared_next is not None:
+                runs.append(float(shared_next))
+        except Exception:
+            pass
+
+        return min(runs) if runs else None
+
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
         # self.model reflects the originally configured model and never
@@ -2139,11 +2307,7 @@ class HermesCLI:
             "model_name": model_name,
             "model_short": model_short,
             "duration": format_duration_compact(elapsed_seconds),
-            "prompt_elapsed": self._format_prompt_elapsed(
-                getattr(self, "_prompt_start_time", None),
-                getattr(self, "_prompt_duration", 0.0),
-                live=getattr(self, "_prompt_start_time", None) is not None,
-            ),
+            "next_loop_countdown": self._format_loop_countdown(self._get_next_loop_run_at()),
             "context_tokens": 0,
             "context_length": None,
             "context_percent": None,
@@ -2323,6 +2487,9 @@ class HermesCLI:
             if width < 76:
                 parts = [f"⚕ {snapshot['model_short']}", percent_label]
                 parts.append(duration_label)
+                next_loop_countdown = snapshot.get("next_loop_countdown")
+                if next_loop_countdown:
+                    parts.append(next_loop_countdown)
                 return self._trim_status_bar_text(" · ".join(parts), width)
 
             if snapshot["context_length"]:
@@ -2334,9 +2501,9 @@ class HermesCLI:
 
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
             parts.append(duration_label)
-            prompt_elapsed = snapshot.get("prompt_elapsed")
-            if prompt_elapsed:
-                parts.append(prompt_elapsed)
+            next_loop_countdown = snapshot.get("next_loop_countdown")
+            if next_loop_countdown:
+                parts.append(next_loop_countdown)
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -2396,11 +2563,11 @@ class HermesCLI:
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
                     ]
-                    # Position 7: per-prompt elapsed timer (live or frozen)
-                    prompt_elapsed = snapshot.get("prompt_elapsed")
-                    if prompt_elapsed:
+                    # Position 7: next scheduled /loop countdown (if any)
+                    next_loop_countdown = snapshot.get("next_loop_countdown")
+                    if next_loop_countdown:
                         frags.append(("class:status-bar-dim", " │ "))
-                        frags.append(("class:status-bar-dim", prompt_elapsed))
+                        frags.append(("class:status-bar-dim", next_loop_countdown))
                     frags.append(("class:status-bar", " "))
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
@@ -3154,6 +3321,7 @@ class HermesCLI:
         route = {
             "model": self.model,
             "runtime": runtime,
+            "allowed_tools": self._next_turn_allowed_tools,
             "signature": (
                 self.model,
                 runtime["provider"],
@@ -3161,8 +3329,10 @@ class HermesCLI:
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                tuple(sorted(self._next_turn_allowed_tools or [])),
             ),
         }
+        self._next_turn_allowed_tools = None
 
         service_tier = getattr(self, "service_tier", None)
         if not service_tier:
@@ -3176,7 +3346,14 @@ class HermesCLI:
         route["request_overrides"] = overrides
         return route
 
-    def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None) -> bool:
+    def _init_agent(
+        self,
+        *,
+        model_override: str = None,
+        runtime_override: dict = None,
+        request_overrides: dict | None = None,
+        allowed_tools_override: list[str] | None = None,
+    ) -> bool:
         """
         Initialize the agent on first use.
         When resuming a session, restores conversation history from SQLite.
@@ -3258,6 +3435,7 @@ class HermesCLI:
                 credential_pool=runtime.get("credential_pool"),
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
+                enabled_tools=allowed_tools_override,
                 verbose_logging=self.verbose,
                 quiet_mode=not self.verbose,
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
@@ -3301,6 +3479,7 @@ class HermesCLI:
                 runtime.get("api_mode"),
                 runtime.get("command"),
                 tuple(runtime.get("args") or ()),
+                tuple(sorted(allowed_tools_override or [])),
             )
 
             if self._pending_title and self._session_db:
@@ -4549,8 +4728,42 @@ class HermesCLI:
         except Exception:
             pass
 
+    def _clear_loop_jobs(self) -> None:
+        """Stop and forget all session-scoped loop jobs for the current session."""
+        try:
+            from tools.session_loop_tool import clear_session_loop_jobs, unregister_session_loop_target
+
+            clear_session_loop_jobs(getattr(self, "session_id", ""))
+            unregister_session_loop_target(getattr(self, "session_id", ""))
+        except Exception:
+            pass
+
+    def _register_session_loop_target(self) -> None:
+        """Register this live interactive session as a session_loop delivery target."""
+        try:
+            from tools.session_loop_tool import register_session_loop_target
+
+            register_session_loop_target(
+                getattr(self, "session_id", ""),
+                enqueue_callback=self._pending_input.put,
+                is_agent_running_callback=lambda: bool(getattr(self, "_agent_running", False)),
+                is_session_alive_callback=lambda: not bool(getattr(self, "_should_exit", False)),
+            )
+        except Exception:
+            pass
+
+    def _move_session_loop_target(self, old_session_id: str, new_session_id: str) -> None:
+        """Move live loop jobs/target after a session_id rotation."""
+        try:
+            from tools.session_loop_tool import move_session_loop_target
+
+            move_session_loop_target(old_session_id, new_session_id)
+        except Exception:
+            pass
+
     def new_session(self, silent=False):
         """Start a fresh session with a new session ID and cleared agent state."""
+        self._clear_loop_jobs()
         if self.agent and self.conversation_history:
             try:
                 self.agent.flush_memories(self.conversation_history)
@@ -4574,6 +4787,7 @@ class HermesCLI:
         timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
         short_uuid = uuid.uuid4().hex[:6]
         self.session_id = f"{timestamp_str}_{short_uuid}"
+        self._register_session_loop_target()
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
@@ -4642,6 +4856,8 @@ class HermesCLI:
             _cprint("  Already on that session.")
             return
 
+        self._clear_loop_jobs()
+
         # End current session
         try:
             self._session_db.end_session(self.session_id, "resumed_other")
@@ -4650,6 +4866,7 @@ class HermesCLI:
 
         # Switch to the target session
         self.session_id = target_id
+        self._register_session_loop_target()
         self._resumed = True
         self._pending_title = None
 
@@ -4727,6 +4944,7 @@ class HermesCLI:
 
         # Save the current session's state before branching
         parent_session_id = self.session_id
+        self._clear_loop_jobs()
 
         # End the old session
         try:
@@ -4773,6 +4991,7 @@ class HermesCLI:
 
         # Switch to the new session
         self.session_id = new_session_id
+        self._register_session_loop_target()
         self.session_start = now
         self._pending_title = None
         self._resumed = True  # Prevents auto-title generation
@@ -5766,6 +5985,130 @@ class HermesCLI:
         from hermes_cli.skills_hub import handle_skills_slash
         handle_skills_slash(cmd, ChatConsole())
 
+    def _handle_loop_command(self, cmd: str):
+        """Handle the /loop command with session-scoped in-memory timers."""
+        try:
+            parsed = _parse_loop_command(cmd)
+        except ValueError as exc:
+            print(f"(._.) {exc}")
+            return
+
+        if parsed["action"] == "help":
+            print()
+            print("+" + "-" * 68 + "+")
+            print("|" + " " * 25 + "(^_^) /loop" + " " * 27 + "|")
+            print("+" + "-" * 68 + "+")
+            print()
+            print("  Session-scoped recurring prompts for this exact chat.")
+            print()
+            print("  Examples:")
+            print("    /loop 10m check the deployment status")
+            print("    /loop check the deployment status every 2h")
+            print("    /loop /review-pr 1234")
+            print("    /loop list")
+            print("    /loop clear")
+            print()
+            print("  Notes:")
+            print("    Default cadence is every 10 minutes.")
+            print("    Timers live only in this current Hermes session.")
+            print("    When a timer fires, the prompt is injected back into this chat as a normal message.")
+            print()
+            return
+
+        if parsed["action"] == "list":
+            with self._loop_lock:
+                jobs = list(self._loop_jobs.values())
+            if not jobs:
+                print("(._.) No /loop jobs in this session.")
+                return
+
+            print()
+            print("/loop Jobs:")
+            print("-" * 80)
+            for job in jobs:
+                next_run = datetime.fromtimestamp(job["next_run_at"]).strftime("%Y-%m-%d %H:%M:%S")
+                prompt_preview = job["prompt"]
+                if len(prompt_preview) > 100:
+                    prompt_preview = prompt_preview[:100] + "..."
+                print(f"  ID: {job['id']}")
+                print(f"  Name: {job['name']}")
+                print(f"  Cadence: {job['cadence']}")
+                print(f"  Next run: {next_run}")
+                print(f"  Fired: {job['fires']}")
+                print(f"  Prompt: {prompt_preview}")
+                print()
+            return
+
+        if parsed["action"] == "clear":
+            with self._loop_lock:
+                jobs = list(self._loop_jobs.values())
+                self._loop_jobs = {}
+            for job in jobs:
+                job["stop_event"].set()
+            print(f"(^_^)b Cleared {len(jobs)} /loop job(s).")
+            return
+
+        interval_seconds = parsed["minutes"] * 60
+        prompt = parsed["prompt"]
+        job_id = uuid.uuid4().hex[:8]
+        stop_event = threading.Event()
+        next_run_at = time.time() + interval_seconds
+        job = {
+            "id": job_id,
+            "name": _loop_job_name(prompt),
+            "prompt": prompt,
+            "minutes": parsed["minutes"],
+            "cadence": parsed["cadence"],
+            "fires": 0,
+            "next_run_at": next_run_at,
+            "stop_event": stop_event,
+        }
+
+        def _queued_loop_message(active_job: Dict[str, Any]) -> str:
+            runtime_note = _build_loop_runtime_note(active_job)
+            msg = build_skill_invocation_message(
+                "/loop",
+                active_job["prompt"],
+                task_id=getattr(self, "session_id", ""),
+                runtime_note=runtime_note,
+            )
+            return msg or active_job["prompt"]
+
+        def _loop_worker():
+            while not stop_event.is_set() and not self._should_exit:
+                remaining = job["next_run_at"] - time.time()
+                if remaining > 0 and stop_event.wait(min(remaining, 1.0)):
+                    return
+                if time.time() < job["next_run_at"]:
+                    continue
+
+                while not stop_event.is_set() and not self._should_exit:
+                    if not self._agent_running:
+                        with self._loop_lock:
+                            active = self._loop_jobs.get(job_id)
+                            if active is None:
+                                return
+                            active["fires"] += 1
+                            active["next_run_at"] = time.time() + interval_seconds
+                            queued_prompt = _queued_loop_message(active)
+                        self._pending_input.put(queued_prompt)
+                        break
+                    if stop_event.wait(1.0):
+                        return
+
+        worker = threading.Thread(target=_loop_worker, daemon=True, name=f"loop-{job_id}")
+        job["thread"] = worker
+        with self._loop_lock:
+            self._loop_jobs[job_id] = job
+        worker.start()
+
+        print(f"(^_^)b Created /loop job: {job_id}")
+        print(f"  Cadence: {parsed['cadence']}")
+        print(f"  First scheduled fire: {datetime.fromtimestamp(next_run_at).strftime('%Y-%m-%d %H:%M:%S')}")
+        for note in parsed.get("notes", []):
+            print(f"  Note: {note}")
+        print("  When it fires, Hermes will inject the prompt back into this same session through the bundled /loop skill.")
+
     def _show_gateway_status(self):
         """Show status of the gateway and connected messaging platforms."""
         from gateway.config import load_gateway_config, Platform
@@ -6169,11 +6512,24 @@ class HermesCLI:
             # Check for skill slash commands (/gif-search, /axolotl, etc.)
             elif base_cmd in _skill_commands:
                 user_instruction = cmd_original[len(base_cmd):].strip()
+                runtime_note = ""
+                if base_cmd == "/loop":
+                    runtime_note = (
+                        "For /loop, use the session_loop tool for same-session scheduling. "
+                        "Do not use cronjob here. cronjob runs in fresh detached sessions and would violate the /loop contract."
+                    )
                 msg = build_skill_invocation_message(
-                    base_cmd, user_instruction, task_id=self.session_id
+                    base_cmd,
+                    user_instruction,
+                    task_id=self.session_id,
+                    runtime_note=runtime_note,
                 )
                 if msg:
                     skill_name = _skill_commands[base_cmd]["name"]
+                    self._next_turn_allowed_tools = get_skill_allowed_tools(
+                        base_cmd,
+                        task_id=self.session_id,
+                    )
                     print(f"\n⚡ Loading skill: {skill_name}")
                     if hasattr(self, '_pending_input'):
                         self._pending_input.put(msg)
@@ -6977,7 +7333,9 @@ class HermesCLI:
                 getattr(self.agent, "session_id", None)
                 and self.agent.session_id != self.session_id
             ):
+                old_session_id = self.session_id
                 self.session_id = self.agent.session_id
+                self._move_session_loop_target(old_session_id, self.session_id)
                 self._pending_title = None
             new_tokens = estimate_messages_tokens_rough(self.conversation_history)
             summary = summarize_manual_compression(
@@ -7342,7 +7700,7 @@ class HermesCLI:
                 self._last_scrollback_tool = function_name
                 try:
                     from agent.display import get_cute_tool_message
-                    line = get_cute_tool_message(function_name, stored_args, duration)
+                    line = get_cute_tool_message(function_name, stored_args, duration, result=kwargs.get("result"))
                     if is_error:
                         line = f"{line} [error]"
                     _cprint(f"  {line}")
@@ -8275,6 +8633,7 @@ class HermesCLI:
             model_override=turn_route["model"],
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
+            allowed_tools_override=turn_route.get("allowed_tools"),
         ):
             return None
         
@@ -8577,7 +8936,9 @@ class HermesCLI:
                 and getattr(self.agent, "session_id", None)
                 and self.agent.session_id != self.session_id
             ):
+                old_session_id = self.session_id
                 self.session_id = self.agent.session_id
+                self._move_session_loop_target(old_session_id, self.session_id)
                 self._pending_title = None
 
             # Get the final response
@@ -9040,6 +9401,11 @@ class HermesCLI:
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
         self._should_exit = False
         self._last_ctrl_c_time = 0  # Track double Ctrl+C for force exit
+        # run() replaces the startup queues created in __init__, so refresh the
+        # live session_loop target here as well. Without this, /loop can point
+        # at a stale/non-interactive registration and look "unregistered" in
+        # the actual shell session.
+        self._register_session_loop_target()
 
         # Give plugin manager a CLI reference so plugins can inject messages
         from hermes_cli.plugins import get_plugin_manager
@@ -9072,6 +9438,7 @@ class HermesCLI:
         # Slash command loading state
         self._command_running = False
         self._command_status = ""
+        self._next_turn_allowed_tools = None
 
         # Secure secret capture state for skill setup
         self._secret_state = None       # dict with var_name, prompt, metadata, response_queue
@@ -10701,6 +11068,7 @@ class HermesCLI:
                 raise
         finally:
             self._should_exit = True
+            self._clear_loop_jobs()
             # Interrupt the agent immediately so its daemon thread stops making
             # API calls and exits promptly (agent_thread is daemon, so the
             # process will exit once the main thread finishes, but interrupting
@@ -10996,6 +11364,7 @@ def main(
                     model_override=turn_route["model"],
                     runtime_override=turn_route["runtime"],
                     request_overrides=turn_route.get("request_overrides"),
+                    allowed_tools_override=turn_route.get("allowed_tools"),
                 ):
                     cli.agent.quiet_mode = True
                     cli.agent.suppress_status_output = True

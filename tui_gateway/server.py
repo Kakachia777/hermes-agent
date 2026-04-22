@@ -70,6 +70,20 @@ _real_stdout = sys.stdout
 sys.stdout = sys.stderr
 
 
+def _loop_trace(message: str) -> None:
+    """Write thin TUI loop-delivery traces when HERMES_LOOP_DEBUG is enabled."""
+    if str(os.getenv("HERMES_LOOP_DEBUG", "")).strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    try:
+        path = _hermes_home / "loop_debug.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{timestamp} [tui_gateway] {message}\n")
+    except Exception:
+        pass
+
+
 class _SlashWorker:
     """Persistent HermesCLI subprocess for slash commands."""
 
@@ -462,6 +476,71 @@ def _tool_progress_enabled(sid: str) -> bool:
     return _session_tool_progress_mode(sid) != "off"
 
 
+def _register_session_loop_target(sid: str) -> None:
+    """Register one live TUI session as a session_loop delivery target."""
+    try:
+        from tools.session_loop_tool import register_session_loop_target
+        session = _sessions.get(sid) or {}
+        aliases: list[str] = []
+        session_key = str(session.get("session_key") or "").strip()
+        if session_key:
+            aliases.append(session_key)
+
+        register_session_loop_target(
+            sid,
+            enqueue_callback=lambda prompt, _sid=sid: _enqueue_session_loop_prompt(_sid, prompt),
+            is_agent_running_callback=lambda _sid=sid: bool(_sessions.get(_sid, {}).get("running", False)),
+            is_session_alive_callback=lambda _sid=sid: _sid in _sessions,
+            aliases=aliases,
+        )
+        _loop_trace(f"registered tui target sid={sid} aliases={aliases}")
+    except Exception:
+        pass
+
+
+def _clear_session_loop_target(sid: str) -> None:
+    """Clear all session_loop jobs and unregister this TUI session target."""
+    try:
+        from tools.session_loop_tool import clear_session_loop_jobs, unregister_session_loop_target
+
+        clear_session_loop_jobs(sid)
+        unregister_session_loop_target(sid)
+        _loop_trace(f"cleared tui target sid={sid}")
+    except Exception:
+        pass
+
+
+def _enqueue_session_loop_prompt(sid: str, prompt: str) -> None:
+    """Deliver a session_loop prompt into a live TUI session when idle.
+
+    ``session_loop(create, run_now=true)`` is called while the current turn is
+    still running, so a direct submit would be rejected as busy. This helper
+    waits until the session becomes idle, then injects the saved prompt back
+    into the same transcript.
+    """
+
+    def _deliver() -> None:
+        _loop_trace(f"enqueue requested sid={sid} prompt={prompt[:120]!r}")
+        while True:
+            session = _sessions.get(sid)
+            if session is None:
+                _loop_trace(f"enqueue dropped sid={sid} reason=missing_session")
+                return
+            if not bool(session.get("running", False)):
+                _loop_trace(f"enqueue submitting sid={sid}")
+                _submit_prompt_turn(
+                    sid,
+                    prompt,
+                    display_text=prompt,
+                    consume_attached_images=False,
+                )
+                return
+            _loop_trace(f"enqueue waiting_idle sid={sid}")
+            time.sleep(0.1)
+
+    threading.Thread(target=_deliver, daemon=True).start()
+
+
 def _restart_slash_worker(session: dict):
     worker = session.get("slash_worker")
     if worker:
@@ -696,7 +775,12 @@ def _count_list(obj: object, *path: str) -> int | None:
     return len(cur) if isinstance(cur, list) else None
 
 
-def _tool_summary(name: str, result: str, duration_s: float | None) -> str | None:
+def _strip_loop_countdown_prefix(text: object) -> str:
+    cleaned = str(text or "").strip()
+    return cleaned[3:] if cleaned.startswith("in ") else cleaned
+
+
+def _tool_summary(name: str, result: str, duration_s: float | None, args: dict | None = None) -> str | None:
     try:
         data = json.loads(result)
     except Exception:
@@ -704,6 +788,7 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
 
     dur = _fmt_tool_duration(duration_s)
     suffix = f" in {dur}" if dur else ""
+    include_duration = True
     text = None
 
     if name == "web_search" and isinstance(data, dict):
@@ -716,7 +801,45 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
         if n is not None:
             text = f"Extracted {n} {'page' if n == 1 else 'pages'}"
 
-    return f"{text or 'Completed'}{suffix}" if (text or dur) else None
+    elif name == "session_loop" and isinstance(data, dict):
+        action = str((args or {}).get("action", "")).strip().lower()
+        include_duration = False
+        if action == "create":
+            job = data.get("job")
+            if isinstance(job, dict):
+                countdown = _strip_loop_countdown_prefix(job.get("next_run_in_display", ""))
+                if countdown:
+                    text = f"Next loop ⏲ {countdown}"
+                else:
+                    cadence = str(job.get("cadence", "")).strip()
+                    if cadence:
+                        text = f"Scheduled {cadence}"
+        elif action == "list":
+            count = data.get("count")
+            jobs = data.get("jobs")
+            if isinstance(count, int):
+                text = f"{count} loop{'s' if count != 1 else ''}"
+                if isinstance(jobs, list) and jobs:
+                    first = jobs[0]
+                    if isinstance(first, dict):
+                        countdown = _strip_loop_countdown_prefix(first.get("next_run_in_display", ""))
+                        if countdown:
+                            text += f" · next ⏲ {countdown}"
+        elif action == "clear":
+            cleared = data.get("cleared")
+            if isinstance(cleared, int):
+                text = f"Cleared {cleared} loop{'s' if cleared != 1 else ''}"
+        elif action == "remove":
+            removed = data.get("removed_job")
+            if isinstance(removed, dict):
+                removed_id = str(removed.get("job_id", "")).strip()
+                text = f"Removed loop {removed_id[:8] or '?'}"
+
+    if text:
+        return f"{text}{suffix if include_duration else ''}"
+    if dur and include_duration:
+        return f"Completed{suffix}"
+    return None
 
 
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
@@ -746,7 +869,7 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     duration_s = time.time() - started_at if started_at else None
     if duration_s is not None:
         payload["duration_s"] = duration_s
-    summary = _tool_summary(name, result, duration_s)
+    summary = _tool_summary(name, result, duration_s, args)
     if summary:
         payload["summary"] = summary
     try:
@@ -1023,6 +1146,7 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
     except Exception:
         pass
     _wire_callbacks(sid)
+    _register_session_loop_target(sid)
     _emit("session.info", sid, _session_info(agent))
 
 
@@ -1113,6 +1237,150 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
     return messages
 
 
+def _submit_prompt_turn(
+    sid: str,
+    text: str,
+    *,
+    display_text: str | None = None,
+    consume_attached_images: bool = True,
+) -> bool:
+    """Submit a prompt into an existing TUI session.
+
+    Used by both normal ``prompt.submit`` RPC calls and internal sources like
+    ``session_loop`` so they share the same run path and transcript updates.
+    """
+    session = _sessions.get(sid)
+    if not session:
+        _loop_trace(f"submit rejected sid={sid} reason=missing_session")
+        return False
+
+    with session["history_lock"]:
+        if session.get("running"):
+            _loop_trace(f"submit rejected sid={sid} reason=busy")
+            return False
+        session["running"] = True
+        history = list(session.get("history", []))
+        history_version = int(session.get("history_version", 0))
+        if consume_attached_images:
+            images = list(session.get("attached_images", []))
+            session["attached_images"] = []
+        else:
+            images = []
+
+    agent = session["agent"]
+    _loop_trace(
+        f"submit start sid={sid} display_text={bool(display_text)} "
+        f"consume_attached_images={consume_attached_images} history_len={len(history)}"
+    )
+    if display_text:
+        _emit("message.injected", sid, {"role": "user", "text": display_text})
+    _emit("message.start", sid)
+
+    def run():
+        approval_token = None
+        session_tokens = []
+        try:
+            from tools.approval import reset_current_session_key, set_current_session_key
+            approval_token = set_current_session_key(session["session_key"])
+            session_tokens = _set_session_context(session["session_key"])
+            cols = session.get("cols", 80)
+            streamer = make_stream_renderer(cols)
+            prompt = text
+
+            if isinstance(prompt, str) and "@" in prompt:
+                from agent.context_references import preprocess_context_references
+                from agent.model_metadata import get_model_context_length
+
+                ctx_len = get_model_context_length(
+                    getattr(agent, "model", "") or _resolve_model(),
+                    base_url=getattr(agent, "base_url", "") or "",
+                    api_key=getattr(agent, "api_key", "") or "",
+                )
+                ctx = preprocess_context_references(
+                    prompt,
+                    cwd=os.environ.get("TERMINAL_CWD", os.getcwd()),
+                    allowed_root=os.environ.get("TERMINAL_CWD", os.getcwd()),
+                    context_length=ctx_len,
+                )
+                if ctx.blocked:
+                    _emit("error", sid, {"message": "\n".join(ctx.warnings) or "Context injection refused."})
+                    return
+                prompt = ctx.message
+
+            prompt = _enrich_with_attached_images(prompt, images) if images else prompt
+
+            def _stream(delta):
+                payload = {"text": delta}
+                if streamer and (r := streamer.feed(delta)) is not None:
+                    payload["rendered"] = r
+                _emit("message.delta", sid, payload)
+
+            result = agent.run_conversation(
+                prompt,
+                conversation_history=list(history),
+                stream_callback=_stream,
+            )
+            _loop_trace(f"submit agent_done sid={sid} result_type={'dict' if isinstance(result, dict) else type(result).__name__}")
+
+            last_reasoning = None
+            status_note = None
+            if isinstance(result, dict):
+                if isinstance(result.get("messages"), list):
+                    with session["history_lock"]:
+                        current_version = int(session.get("history_version", 0))
+                        if current_version == history_version:
+                            session["history"] = result["messages"]
+                            session["history_version"] = history_version + 1
+                        else:
+                            print(
+                                f"[tui_gateway] prompt.submit: history_version mismatch "
+                                f"(expected={history_version} current={current_version}) — "
+                                f"agent output NOT written to session history",
+                                file=sys.stderr,
+                            )
+                            status_note = (
+                                "History changed during this turn — the response above is visible "
+                                "but was not saved to session history."
+                            )
+                raw = result.get("final_response", "")
+                status = "interrupted" if result.get("interrupted") else "error" if result.get("error") else "complete"
+                lr = result.get("last_reasoning")
+                if isinstance(lr, str) and lr.strip():
+                    last_reasoning = lr.strip()
+            else:
+                raw = str(result)
+                status = "complete"
+
+            payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if last_reasoning:
+                payload["reasoning"] = last_reasoning
+            if status_note:
+                payload["warning"] = status_note
+            rendered = render_message(raw, cols)
+            if rendered:
+                payload["rendered"] = rendered
+            _emit("message.complete", sid, payload)
+            _loop_trace(f"submit complete sid={sid} status={status} text_len={len(raw)}")
+        except Exception as e:
+            _emit("error", sid, {"message": str(e)})
+            _loop_trace(f"submit error sid={sid} error={e}")
+        finally:
+            try:
+                if approval_token is not None:
+                    reset_current_session_key(approval_token)
+            except Exception:
+                pass
+            _clear_session_context(session_tokens)
+            current = _sessions.get(sid)
+            if current is not None:
+                with current["history_lock"]:
+                    current["running"] = False
+            _loop_trace(f"submit finished sid={sid}")
+
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
 # ── Methods: session ─────────────────────────────────────────────────
 
 @method("session.create")
@@ -1186,6 +1454,7 @@ def _(rid, params: dict) -> dict:
                 pass
 
             _wire_callbacks(sid)
+            _register_session_loop_target(sid)
 
             info = _session_info(agent)
             warn = _probe_credentials(agent)
@@ -1407,6 +1676,7 @@ def _(rid, params: dict) -> dict:
     session = _sessions.pop(sid, None)
     if not session:
         return _ok(rid, {"closed": False})
+    _clear_session_loop_target(sid)
     try:
         from tools.approval import unregister_gateway_notify
 
@@ -1522,120 +1792,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    with session["history_lock"]:
-        if session.get("running"):
-            return _err(rid, 4009, "session busy")
-        session["running"] = True
-        history = list(session["history"])
-        history_version = int(session.get("history_version", 0))
-        images = list(session.get("attached_images", []))
-        session["attached_images"] = []
-    agent = session["agent"]
-    _emit("message.start", sid)
-
-    def run():
-        approval_token = None
-        session_tokens = []
-        try:
-            from tools.approval import reset_current_session_key, set_current_session_key
-            approval_token = set_current_session_key(session["session_key"])
-            session_tokens = _set_session_context(session["session_key"])
-            cols = session.get("cols", 80)
-            streamer = make_stream_renderer(cols)
-            prompt = text
-
-            if isinstance(prompt, str) and "@" in prompt:
-                from agent.context_references import preprocess_context_references
-                from agent.model_metadata import get_model_context_length
-
-                ctx_len = get_model_context_length(
-                    getattr(agent, "model", "") or _resolve_model(),
-                    base_url=getattr(agent, "base_url", "") or "",
-                    api_key=getattr(agent, "api_key", "") or "",
-                )
-                ctx = preprocess_context_references(
-                    prompt,
-                    cwd=os.environ.get("TERMINAL_CWD", os.getcwd()),
-                    allowed_root=os.environ.get("TERMINAL_CWD", os.getcwd()),
-                    context_length=ctx_len,
-                )
-                if ctx.blocked:
-                    _emit("error", sid, {"message": "\n".join(ctx.warnings) or "Context injection refused."})
-                    return
-                prompt = ctx.message
-
-            prompt = _enrich_with_attached_images(prompt, images) if images else prompt
-
-            def _stream(delta):
-                payload = {"text": delta}
-                if streamer and (r := streamer.feed(delta)) is not None:
-                    payload["rendered"] = r
-                _emit("message.delta", sid, payload)
-
-            result = agent.run_conversation(
-                prompt, conversation_history=list(history),
-                stream_callback=_stream,
-            )
-
-            last_reasoning = None
-            status_note = None
-            if isinstance(result, dict):
-                if isinstance(result.get("messages"), list):
-                    with session["history_lock"]:
-                        current_version = int(session.get("history_version", 0))
-                        if current_version == history_version:
-                            session["history"] = result["messages"]
-                            session["history_version"] = history_version + 1
-                        else:
-                            # History mutated externally during the turn
-                            # (undo/compress/retry/rollback now guard on
-                            # session.running, but this is the defensive
-                            # backstop for any path that slips past).
-                            # Surface the desync rather than silently
-                            # dropping the agent's output — the UI can
-                            # show the response and warn that it was
-                            # not persisted.
-                            print(
-                                f"[tui_gateway] prompt.submit: history_version mismatch "
-                                f"(expected={history_version} current={current_version}) — "
-                                f"agent output NOT written to session history",
-                                file=sys.stderr,
-                            )
-                            status_note = (
-                                "History changed during this turn — the response above is visible "
-                                "but was not saved to session history."
-                            )
-                raw = result.get("final_response", "")
-                status = "interrupted" if result.get("interrupted") else "error" if result.get("error") else "complete"
-                lr = result.get("last_reasoning")
-                if isinstance(lr, str) and lr.strip():
-                    last_reasoning = lr.strip()
-            else:
-                raw = str(result)
-                status = "complete"
-
-            payload = {"text": raw, "usage": _get_usage(agent), "status": status}
-            if last_reasoning:
-                payload["reasoning"] = last_reasoning
-            if status_note:
-                payload["warning"] = status_note
-            rendered = render_message(raw, cols)
-            if rendered:
-                payload["rendered"] = rendered
-            _emit("message.complete", sid, payload)
-        except Exception as e:
-            _emit("error", sid, {"message": str(e)})
-        finally:
-            try:
-                if approval_token is not None:
-                    reset_current_session_key(approval_token)
-            except Exception:
-                pass
-            _clear_session_context(session_tokens)
-            with session["history_lock"]:
-                session["running"] = False
-
-    threading.Thread(target=run, daemon=True).start()
+    if not _submit_prompt_turn(sid, text, consume_attached_images=True):
+        return _err(rid, 4009, "session busy")
     return _ok(rid, {"status": "streaming"})
 
 
@@ -2326,7 +2484,18 @@ def _(rid, params: dict) -> dict:
         cmds = scan_skill_commands()
         key = f"/{name}"
         if key in cmds:
-            msg = build_skill_invocation_message(key, arg, task_id=session.get("session_key", "") if session else "")
+            runtime_note = ""
+            if key == "/loop":
+                runtime_note = (
+                    "For /loop, use the session_loop tool for same-session scheduling. "
+                    "Do not use cronjob here. cronjob runs in fresh detached sessions and would violate the /loop contract."
+                )
+            msg = build_skill_invocation_message(
+                key,
+                arg,
+                task_id=params.get("session_id", "") if session else "",
+                runtime_note=runtime_note,
+            )
             if msg:
                 return _ok(rid, {"type": "skill", "message": msg, "name": cmds[key].get("name", name)})
     except Exception:

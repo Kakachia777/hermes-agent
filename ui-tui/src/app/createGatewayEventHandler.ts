@@ -167,6 +167,21 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'message.injected': {
+        const text = String(ev.payload?.text ?? '').trim()
+
+        if (!text) {
+          return
+        }
+
+        appendMessage({
+          role: ev.payload?.role ?? 'user',
+          text
+        })
+
+        return
+      }
+
       case 'message.start':
         turnController.startMessage()
 

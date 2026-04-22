@@ -3728,8 +3728,14 @@ class GatewayRunner:
                                 f"Enable it with: `hermes skills config`"
                             )
                     user_instruction = event.get_command_args().strip()
+                    runtime_note = ""
+                    if cmd_key == "/loop":
+                        runtime_note = (
+                            "For /loop, use the session_loop tool for same-session scheduling. "
+                            "Do not use cronjob here. cronjob runs in fresh detached sessions and would violate the /loop contract."
+                        )
                     msg = build_skill_invocation_message(
-                        cmd_key, user_instruction, task_id=_quick_key
+                        cmd_key, user_instruction, task_id=_quick_key, runtime_note=runtime_note
                     )
                     if msg:
                         event.text = msg

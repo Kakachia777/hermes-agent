@@ -390,6 +390,106 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
     assert captured["prompt"] == "expanded prompt"
 
 
+def test_submit_prompt_turn_emits_injected_user_message(monkeypatch):
+    emitted = []
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            return {"final_response": "ok", "messages": [{"role": "assistant", "content": "ok"}]}
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload)))
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    try:
+        assert server._submit_prompt_turn("sid", "check time", display_text="check time", consume_attached_images=False) is True
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert ("message.injected", "sid", {"role": "user", "text": "check time"}) in emitted
+    assert any(event == "message.complete" and sid == "sid" for event, sid, _ in emitted)
+
+
+def test_init_session_registers_session_loop_target(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": "x"})
+    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "tools.session_loop_tool.register_session_loop_target",
+        lambda session_id, **kwargs: seen.update({"session_id": session_id, **kwargs}),
+    )
+
+    try:
+        server._init_session("sid", "session-key", types.SimpleNamespace(model="x"), [], cols=80)
+        assert seen["session_id"] == "sid"
+        assert callable(seen["enqueue_callback"])
+        assert callable(seen["is_agent_running_callback"])
+        assert callable(seen["is_session_alive_callback"])
+        assert seen["aliases"] == ["session-key"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_enqueue_session_loop_prompt_waits_until_session_is_idle(monkeypatch):
+    submitted = []
+    session = _session(agent=types.SimpleNamespace(), running=True)
+    server._sessions["sid"] = session
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    def _fake_submit(sid, text, display_text=None, consume_attached_images=True):
+        submitted.append((sid, text, display_text, consume_attached_images))
+        return True
+
+    def _fake_sleep(_seconds):
+        server._sessions["sid"]["running"] = False
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_submit_prompt_turn", _fake_submit)
+    monkeypatch.setattr(server.time, "sleep", _fake_sleep)
+
+    try:
+        server._enqueue_session_loop_prompt("sid", "check time")
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert submitted == [("sid", "check time", "check time", False)]
+
+
+def test_tool_summary_for_session_loop_create_prefers_next_countdown():
+    result = json.dumps(
+        {
+            "success": True,
+            "job": {
+                "job_id": "abc12345",
+                "next_run_in_display": "in 1m 0s",
+                "cadence": "every 1 minute",
+            },
+        }
+    )
+
+    summary = server._tool_summary("session_loop", result, 0.0, {"action": "create"})
+
+    assert summary == "Next loop ⏲ 1m 0s"
+
+
 def test_image_attach_appends_local_image(monkeypatch):
     fake_cli = types.ModuleType("cli")
     fake_cli._IMAGE_EXTENSIONS = {".png"}

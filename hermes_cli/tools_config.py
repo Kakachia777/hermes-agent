@@ -64,6 +64,7 @@ CONFIGURABLE_TOOLSETS = [
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
+    ("session_loop",    "🔁 Session Loops",             "same-session recurring prompts for /loop"),
     ("messaging",       "📨 Cross-Platform Messaging",  "send_message"),
     ("rl",              "🧪 RL Training",               "Tinker-Atropos training tools"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
@@ -643,6 +644,14 @@ def _get_platform_tools(
             enabled_toolsets.update(enabled_mcp_servers)
     else:
         enabled_toolsets.update(explicit_mcp_servers)
+
+    # Back-compat for existing CLI configs saved before the session_loop
+    # toolset existed in the configurator. /loop is a bundled skill for the
+    # interactive CLI, so old explicit CLI toolset lists should gain the
+    # underlying live-session scheduler automatically instead of silently
+    # breaking until the user re-saves `hermes tools`.
+    if platform == "cli" and "skills" in enabled_toolsets:
+        enabled_toolsets.add("session_loop")
 
     return enabled_toolsets
 

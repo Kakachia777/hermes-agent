@@ -196,6 +196,7 @@ _LEGACY_TOOLSET_MAP = {
 def get_tool_definitions(
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
+    enabled_tools: List[str] = None,
     quiet_mode: bool = False,
 ) -> List[Dict[str, Any]]:
     """
@@ -206,6 +207,9 @@ def get_tool_definitions(
     Args:
         enabled_toolsets: Only include tools from these toolsets.
         disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
+        enabled_tools: Optional explicit tool-name allowlist applied after
+            toolset resolution. Useful for skill-scoped turns that should see
+            only a narrow subset of an otherwise larger toolset.
         quiet_mode: Suppress status prints.
 
     Returns:
@@ -253,6 +257,9 @@ def get_tool_definitions(
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
+
+    if enabled_tools is not None:
+        tools_to_include.intersection_update({str(name).strip() for name in enabled_tools if str(name).strip()})
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()

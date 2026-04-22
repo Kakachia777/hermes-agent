@@ -8,6 +8,7 @@ from agent.display import (
     build_tool_preview,
     capture_local_edit_snapshot,
     extract_edit_diff,
+    get_cute_tool_message,
     _render_inline_unified_diff,
     _summarize_rendered_diff_sections,
     render_edit_diff_with_delta,
@@ -94,6 +95,28 @@ class TestBuildToolPreview:
         result = build_tool_preview("session_search", {"query": "find something"})
         assert result is not None
         assert "find something" in result
+
+    def test_session_loop_create_preview_includes_cadence_and_prompt(self):
+        result = build_tool_preview(
+            "session_loop",
+            {"action": "create", "interval_minutes": 1, "prompt": "check the current time"},
+        )
+        assert result == "every 1m · check the current time"
+
+    def test_session_loop_management_preview_is_human(self):
+        assert build_tool_preview("session_loop", {"action": "list"}) == "list loops"
+        assert build_tool_preview("session_loop", {"action": "clear"}) == "clear loops"
+
+    def test_session_loop_cute_message_prefers_next_countdown(self):
+        msg = get_cute_tool_message(
+            "session_loop",
+            {"action": "create", "interval_minutes": 1, "prompt": "check the current time"},
+            0.0,
+            result='{"job":{"next_run_in_display":"in 1m 0s"}}',
+        )
+        assert "session loop" in msg
+        assert "check the current time" in msg
+        assert "⏲ 1m 0s" in msg
 
     def test_false_like_args_zero(self):
         """Non-dict falsy values should return None, not crash."""

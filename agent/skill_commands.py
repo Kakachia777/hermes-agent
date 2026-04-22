@@ -465,6 +465,52 @@ def build_skill_invocation_message(
     )
 
 
+def get_skill_allowed_tools(
+    cmd_key: str,
+    task_id: str | None = None,
+) -> list[str] | None:
+    """Return a skill's ``allowedTools`` frontmatter as a normalized list.
+
+    Hermes skill invocation is prompt-based by default, so skills can still
+    see the session's wider tool pool unless the caller chooses to enforce a
+    turn-local allowlist. This helper exposes the skill-declared allowlist so
+    CLI/gateway layers can scope the next turn accordingly.
+    """
+    commands = get_skill_commands()
+    skill_info = commands.get(cmd_key)
+    if not skill_info:
+        return None
+
+    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
+    if not loaded:
+        return None
+
+    loaded_skill, _, _ = loaded
+
+    try:
+        from tools.skills_tool import _parse_frontmatter
+
+        raw_content = str(loaded_skill.get("content") or "")
+        frontmatter, _ = _parse_frontmatter(raw_content)
+    except Exception:
+        return None
+
+    raw_allowed = frontmatter.get("allowedTools")
+    if not isinstance(raw_allowed, list):
+        return None
+
+    allowed_tools: list[str] = []
+    seen: set[str] = set()
+    for item in raw_allowed:
+        name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        allowed_tools.append(name)
+
+    return allowed_tools or None
+
+
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,

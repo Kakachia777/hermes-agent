@@ -167,6 +167,102 @@ def _oneline(text: str) -> str:
     return " ".join(text.split())
 
 
+def _compact_loop_interval(minutes: object) -> str | None:
+    """Render whole-minute loop cadences in a short human form."""
+    try:
+        value = int(minutes)
+    except (TypeError, ValueError):
+        return None
+    if value < 1:
+        return None
+    if value % 1440 == 0:
+        return f"{value // 1440}d"
+    if value % 60 == 0:
+        return f"{value // 60}h"
+    return f"{value}m"
+
+
+def _truncate_preview(text: str, max_len: int) -> str:
+    if max_len > 0 and len(text) > max_len:
+        return text[:max_len - 3] + "..."
+    return text
+
+
+def _session_loop_preview(args: dict, max_len: int) -> str | None:
+    action = str(args.get("action", "")).strip().lower()
+    if action == "create":
+        prompt = _oneline(str(args.get("prompt", "")).strip())
+        cadence = _compact_loop_interval(args.get("interval_minutes"))
+        parts = []
+        if cadence:
+            parts.append(f"every {cadence}")
+        if prompt:
+            parts.append(prompt)
+        preview = " · ".join(parts) if parts else "create loop"
+        return _truncate_preview(preview, max_len)
+    if action == "list":
+        return "list loops"
+    if action == "clear":
+        return "clear loops"
+    if action == "remove":
+        job_id = _oneline(str(args.get("job_id", "")).strip())
+        preview = f"remove {job_id[:8]}".strip()
+        return _truncate_preview(preview, max_len) if preview else "remove loop"
+    if action:
+        return _truncate_preview(action, max_len)
+    return None
+
+
+def _strip_loop_countdown_prefix(text: str) -> str:
+    cleaned = str(text or "").strip()
+    return cleaned[3:] if cleaned.startswith("in ") else cleaned
+
+
+def _session_loop_result_detail(result: str | None, duration: float) -> str:
+    """Return a loop-specific completion detail, or fall back to tool duration."""
+    fallback = f"{duration:.1f}s"
+    if not result:
+        return fallback
+
+    data = safe_json_loads(result)
+    if not isinstance(data, dict):
+        return fallback
+
+    job = data.get("job")
+    if isinstance(job, dict):
+        countdown = _strip_loop_countdown_prefix(job.get("next_run_in_display", ""))
+        if countdown:
+            return f"⏲ {countdown}"
+        cadence = _oneline(str(job.get("cadence", "")).strip())
+        if cadence:
+            return cadence
+
+    removed_job = data.get("removed_job")
+    if isinstance(removed_job, dict):
+        removed_id = _oneline(str(removed_job.get("job_id", "")).strip())
+        if removed_id:
+            return f"removed {removed_id[:8]}"
+        return "removed"
+
+    cleared = data.get("cleared")
+    if isinstance(cleared, int):
+        return f"cleared {cleared}"
+
+    count = data.get("count")
+    jobs = data.get("jobs")
+    if isinstance(count, int):
+        label = f"{count} loop{'s' if count != 1 else ''}"
+        if isinstance(jobs, list) and jobs:
+            first = jobs[0]
+            if isinstance(first, dict):
+                countdown = _strip_loop_countdown_prefix(first.get("next_run_in_display", ""))
+                if countdown:
+                    return f"{label} · ⏲ {countdown}"
+        return label
+
+    return fallback
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
@@ -217,6 +313,9 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     if tool_name == "session_search":
         query = _oneline(args.get("query", ""))
         return f"recall: \"{query[:25]}{'...' if len(query) > 25 else ''}\""
+
+    if tool_name == "session_loop":
+        return _session_loop_preview(args, max_len)
 
     if tool_name == "memory":
         action = args.get("action", "")
@@ -972,6 +1071,10 @@ def get_cute_tool_message(
         if action == "list":
             return _wrap(f"┊ ⏰ cron      listing  {dur}")
         return _wrap(f"┊ ⏰ cron      {action} {args.get('job_id', '')}  {dur}")
+    if tool_name == "session_loop":
+        preview = build_tool_preview(tool_name, args, max_len=34) or _trunc(args.get("action", "loop"), 30)
+        detail = _session_loop_result_detail(result, duration)
+        return _wrap(f"┊ 🔁 session loop  {_trunc(preview, 34)}  {detail}")
     if tool_name.startswith("rl_"):
         rl = {
             "rl_list_environments": "list envs", "rl_select_environment": f"select {args.get('name', '')}",

@@ -29,6 +29,11 @@ def test_get_platform_tools_uses_default_when_platform_not_configured():
 def test_configurable_toolsets_include_messaging():
     assert any(ts_key == "messaging" for ts_key, _, _ in CONFIGURABLE_TOOLSETS)
 
+
+def test_configurable_toolsets_include_session_loop():
+    assert any(ts_key == "session_loop" for ts_key, _, _ in CONFIGURABLE_TOOLSETS)
+
+
 def test_get_platform_tools_default_telegram_includes_messaging():
     enabled = _get_platform_tools({}, "telegram")
 
@@ -128,6 +133,20 @@ def test_get_platform_tools_keeps_enabled_mcp_servers_with_explicit_builtin_sele
     assert "memory" in enabled
     assert "exa" in enabled
     assert "web-search-prime" in enabled
+
+
+def test_get_platform_tools_backfills_session_loop_for_existing_cli_skill_configs():
+    config = {
+        "platform_toolsets": {
+            "cli": ["web", "terminal", "skills", "cronjob"],
+        },
+    }
+
+    enabled = _get_platform_tools(config, "cli")
+
+    assert "skills" in enabled
+    assert "cronjob" in enabled
+    assert "session_loop" in enabled
 
 
 def test_get_platform_tools_no_mcp_sentinel_excludes_all_mcp_servers():

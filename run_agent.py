@@ -720,6 +720,7 @@ class AIAgent:
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
+        enabled_tools: List[str] = None,
         save_trajectories: bool = False,
         verbose_logging: bool = False,
         quiet_mode: bool = False,
@@ -782,6 +783,8 @@ class AIAgent:
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
             enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
             disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
+            enabled_tools (List[str]): Optional explicit tool-name allowlist
+                applied after toolset filtering for this agent instance.
             save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
             verbose_logging (bool): Enable verbose logging for debugging (default: False)
             quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
@@ -819,6 +822,7 @@ class AIAgent:
         # Consumed by every LLM turn across parent + all subagents.
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
         self.tool_delay = tool_delay
+        self.enabled_tools = enabled_tools
         self.save_trajectories = save_trajectories
         self.verbose_logging = verbose_logging
         self.quiet_mode = quiet_mode
@@ -1302,6 +1306,7 @@ class AIAgent:
         self.tools = get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
+            enabled_tools=enabled_tools,
             quiet_mode=self.quiet_mode,
         )
         
@@ -1318,6 +1323,8 @@ class AIAgent:
                     print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
                 if disabled_toolsets:
                     print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
+                if enabled_tools is not None:
+                    print(f"   🎯 Enabled tools: {', '.join(sorted(self.valid_tool_names)) if self.valid_tool_names else 'none'}")
         elif not self.quiet_mode:
             print("🛠️  No tools loaded (all tools filtered out or unavailable)")
         
@@ -7842,6 +7849,7 @@ class AIAgent:
                         self.tool_progress_callback(
                             "tool.completed", function_name, None, None,
                             duration=tool_duration, is_error=is_error,
+                            result=function_result,
                         )
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
@@ -8213,6 +8221,7 @@ class AIAgent:
                     self.tool_progress_callback(
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=_is_error_result,
+                        result=function_result,
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")

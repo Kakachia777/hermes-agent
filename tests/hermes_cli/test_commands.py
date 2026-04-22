@@ -471,6 +471,7 @@ class TestSubcommands:
         assert "/help" not in SUBCOMMANDS
         assert "/quit" not in SUBCOMMANDS
         assert "/clear" not in SUBCOMMANDS
+        assert "/loop" not in SUBCOMMANDS
 
 
 # ── Subcommand tab completion ───────────────────────────────────────────

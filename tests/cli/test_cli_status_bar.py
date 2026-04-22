@@ -206,6 +206,67 @@ class TestCLIStatusBar:
         assert "⚕" in text
         assert "claude-sonnet-4-20250514" in text
 
+    def test_status_bar_hides_loop_countdown_when_no_loops_exist(self):
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000,
+            completion_tokens=2_400,
+            total_tokens=12_400,
+            api_calls=7,
+            context_tokens=12_400,
+            context_length=200_000,
+        )
+        cli_obj._loop_jobs = {}
+        cli_obj._loop_lock = MagicMock()
+        cli_obj._loop_lock.__enter__.return_value = None
+        cli_obj._loop_lock.__exit__.return_value = None
+
+        text = cli_obj._build_status_bar_text(width=120)
+
+        assert "⏲" not in text
+
+    def test_status_bar_shows_next_loop_countdown_when_loop_exists(self):
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000,
+            completion_tokens=2_400,
+            total_tokens=12_400,
+            api_calls=7,
+            context_tokens=12_400,
+            context_length=200_000,
+        )
+        cli_obj._loop_jobs = {"loop-1": {"next_run_at": 1_700_000_060.0}}
+        cli_obj._loop_lock = MagicMock()
+        cli_obj._loop_lock.__enter__.return_value = None
+        cli_obj._loop_lock.__exit__.return_value = None
+
+        with patch("cli.time.time", return_value=1_700_000_000.0):
+            text = cli_obj._build_status_bar_text(width=120)
+
+        assert "⏲ 1m" in text
+
+    def test_status_bar_shows_shared_session_loop_countdown_when_skill_loop_exists(self):
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000,
+            completion_tokens=2_400,
+            total_tokens=12_400,
+            api_calls=7,
+            context_tokens=12_400,
+            context_length=200_000,
+        )
+        cli_obj.session_id = "live-session"
+        cli_obj._loop_jobs = {}
+        cli_obj._loop_lock = MagicMock()
+        cli_obj._loop_lock.__enter__.return_value = None
+        cli_obj._loop_lock.__exit__.return_value = None
+
+        with patch("cli.time.time", return_value=1_700_000_000.0), \
+             patch("tools.session_loop_tool.get_next_session_loop_run_at", return_value=1_700_000_060.0):
+            text = cli_obj._build_status_bar_text(width=120)
+
+        assert "⏲ 1m" in text
+
     def test_minimal_tui_chrome_threshold(self):
         cli_obj = _make_cli()
 

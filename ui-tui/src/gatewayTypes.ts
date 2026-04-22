@@ -296,6 +296,7 @@ export type GatewayEvent =
   | { payload?: GatewaySkin; session_id?: string; type: 'skin.changed' }
   | { payload: SessionInfo; session_id?: string; type: 'session.info' }
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
+  | { payload: { role?: 'assistant' | 'system' | 'tool' | 'user'; text?: string }; session_id?: string; type: 'message.injected' }
   | { payload?: undefined; session_id?: string; type: 'message.start' }
   | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
   | { payload: { line: string }; session_id?: string; type: 'gateway.stderr' }
